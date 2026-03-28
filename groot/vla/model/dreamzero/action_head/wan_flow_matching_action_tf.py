@@ -3,6 +3,7 @@ import logging
 import time
 from typing import TypeAlias, cast
 import os
+import nvtx
 
 from accelerate import load_checkpoint_and_dispatch
 
@@ -1048,56 +1049,59 @@ class WANPolicyHead(ActionHead):
 
         start_text_encoder_event.record()
 
-        text_inputs = self._prepare_text_inputs(data)
-        prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
+        with nvtx.annotate("text_encoder", color="blue"):
+            text_inputs = self._prepare_text_inputs(data)
+            prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
 
         end_text_encoder_event.record()
         
         start_image_encoder_event.record()
 
-        _, _, num_frames, height, width = videos.shape
-        if videos.shape[2] == 4 or videos.shape[2] == 9:
-            # special case for real-world eval where language is updated
-            image = videos[:, :, -1:].transpose(1, 2)
-        else:
-            image = videos[:, :, :1].transpose(1, 2)
+        with nvtx.annotate("image_encoder", color="cyan"):
+            _, _, num_frames, height, width = videos.shape
+            if videos.shape[2] == 4 or videos.shape[2] == 9:
+                # special case for real-world eval where language is updated
+                image = videos[:, :, -1:].transpose(1, 2)
+            else:
+                image = videos[:, :, :1].transpose(1, 2)
 
-        if self.current_start_frame == 0:
-            clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
-            self.clip_feas = clip_feas.to(dtype=image.dtype)
-            self.ys = ys.to(dtype=image.dtype)
-        
-        assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
+            if self.current_start_frame == 0:
+                clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
+                self.clip_feas = clip_feas.to(dtype=image.dtype)
+                self.ys = ys.to(dtype=image.dtype)
+
+            assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
 
         end_image_encoder_event.record()
 
         start_vae_event.record()
 
-        if latent_video is not None and self.current_start_frame != 0:
-            image = latent_video
-            if self.ip_rank == 0:
-                print("image shape@@", image.shape)
-        elif self.current_start_frame != 0:
-            # this is for real world execution
-            if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
-                print("no further action")
-            elif videos.shape[2] // 4 != self.num_frame_per_block:
-                # Repeating videos along dim 2.
-                repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-            
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-            else: 
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-           
-            image = self.vae.encode(
-                videos,
-                tiled=self.tiled,
-                tile_size=(self.tile_size_height, self.tile_size_width),
-                tile_stride=(self.tile_stride_height, self.tile_stride_width),
-            )
+        with nvtx.annotate("vae_encoder", color="yellow"):
+            if latent_video is not None and self.current_start_frame != 0:
+                image = latent_video
+                if self.ip_rank == 0:
+                    print("image shape@@", image.shape)
+            elif self.current_start_frame != 0:
+                # this is for real world execution
+                if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
+                    print("no further action")
+                elif videos.shape[2] // 4 != self.num_frame_per_block:
+                    # Repeating videos along dim 2.
+                    repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
+                    videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
+
+                    first_frame = videos[:, :, 0:1]  # Extract first frame
+                    videos = torch.cat([first_frame, videos], dim=2)
+                else:
+                    first_frame = videos[:, :, 0:1]  # Extract first frame
+                    videos = torch.cat([first_frame, videos], dim=2)
+
+                image = self.vae.encode(
+                    videos,
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
 
         end_vae_event.record()
 
@@ -1140,54 +1144,55 @@ class WANPolicyHead(ActionHead):
 
         start_kv_event.record()
 
-        if self.current_start_frame == 0:
-            timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
-            self._run_diffusion_steps(
-                noisy_input=image.transpose(1, 2),
-                timestep=timestep * 0,
-                action=None,
-                timestep_action=None,
-                state=None,
-                embodiment_id=None,
-                context=prompt_embs,
-                seq_len=frame_seqlen,
-                y=self.ys[:, :, 0:1],
-                clip_feature=self.clip_feas,
-                kv_caches=kv_caches,
-                crossattn_caches=crossattn_caches,
-                kv_cache_metadata=dict(
-                    start_frame=0,
-                    update_kv_cache=True,
-                ),
-            )
-            self.current_start_frame += 1
-            
-        timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
+        with nvtx.annotate("kv_cache_prefill", color="orange"):
+            if self.current_start_frame == 0:
+                timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
+                self._run_diffusion_steps(
+                    noisy_input=image.transpose(1, 2),
+                    timestep=timestep * 0,
+                    action=None,
+                    timestep_action=None,
+                    state=None,
+                    embodiment_id=None,
+                    context=prompt_embs,
+                    seq_len=frame_seqlen,
+                    y=self.ys[:, :, 0:1],
+                    clip_feature=self.clip_feas,
+                    kv_caches=kv_caches,
+                    crossattn_caches=crossattn_caches,
+                    kv_cache_metadata=dict(
+                        start_frame=0,
+                        update_kv_cache=True,
+                    ),
+                )
+                self.current_start_frame += 1
 
-        if self.current_start_frame != 1:
-            current_ref_latents = image[:, -self.num_frame_per_block:]
-            if self.current_start_frame <= self.ys.shape[2]:
-                y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
-            else:
-                y = self.ys[:, :, -self.num_frame_per_block:]
-            self._run_diffusion_steps(
-                noisy_input=current_ref_latents.transpose(1, 2),
-                timestep=timestep * 0,
-                action=None,
-                timestep_action=None,
-                state=None,
-                embodiment_id=None,
-                context=prompt_embs,
-                seq_len=seq_len,
-                y=y,
-                clip_feature=self.clip_feas,
-                kv_caches=kv_caches,
-                crossattn_caches=crossattn_caches,
-                kv_cache_metadata=dict(
-                    start_frame=self.current_start_frame - self.num_frame_per_block,
-                    update_kv_cache=True,
-                ),
-            )
+            timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
+
+            if self.current_start_frame != 1:
+                current_ref_latents = image[:, -self.num_frame_per_block:]
+                if self.current_start_frame <= self.ys.shape[2]:
+                    y = self.ys[:, :, self.current_start_frame - self.num_frame_per_block : self.current_start_frame]
+                else:
+                    y = self.ys[:, :, -self.num_frame_per_block:]
+                self._run_diffusion_steps(
+                    noisy_input=current_ref_latents.transpose(1, 2),
+                    timestep=timestep * 0,
+                    action=None,
+                    timestep_action=None,
+                    state=None,
+                    embodiment_id=None,
+                    context=prompt_embs,
+                    seq_len=seq_len,
+                    y=y,
+                    clip_feature=self.clip_feas,
+                    kv_caches=kv_caches,
+                    crossattn_caches=crossattn_caches,
+                    kv_cache_metadata=dict(
+                        start_frame=self.current_start_frame - self.num_frame_per_block,
+                        update_kv_cache=True,
+                    ),
+                )
 
         end_kv_event.record()
 
@@ -1229,60 +1234,62 @@ class WANPolicyHead(ActionHead):
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
-            # Get timesteps from respective schedulers
-            action_timestep = sample_scheduler_action.timesteps[index]
-            video_timestep = sample_scheduler.timesteps[index]  # Already rescaled if decoupled
+            with nvtx.annotate(f"dit_step_{index}", color="red"):
+                # Get timesteps from respective schedulers
+                action_timestep = sample_scheduler_action.timesteps[index]
+                video_timestep = sample_scheduler.timesteps[index]  # Already rescaled if decoupled
 
-            # set current timestep
-            timestep = torch.ones(
-                [batch_size, self.num_frame_per_block],
-                device=noise_obs.device,
-                dtype=torch.int64,
-            ) * video_timestep
-            timestep_action = torch.ones(
-                [batch_size, self.action_horizon],
-                device=noise_obs.device,
-                dtype=torch.int64,
-            ) * action_timestep
+                # set current timestep
+                timestep = torch.ones(
+                    [batch_size, self.num_frame_per_block],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * video_timestep
+                timestep_action = torch.ones(
+                    [batch_size, self.action_horizon],
+                    device=noise_obs.device,
+                    dtype=torch.int64,
+                ) * action_timestep
 
-            # check if we need to run the DIT step
-            should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
-            if should_run_model:
-                dit_compute_steps += 1
-                if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
-                    y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                # check if we need to run the DIT step
+                should_run_model = self.should_run_model(index, current_timestep, prev_predictions)
+                if should_run_model:
+                    dit_compute_steps += 1
+                    if self.current_start_frame + self.num_frame_per_block <= self.ys.shape[2]:
+                        y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
+                    else:
+                        y = self.ys[:, :, -self.num_frame_per_block:]
+                    with nvtx.annotate("dit_forward", color="magenta"):
+                        predictions = self._run_diffusion_steps(
+                            noisy_input=noisy_input.transpose(1, 2),
+                            timestep=timestep,
+                            action=noisy_input_action,
+                            timestep_action=timestep_action,
+                            state=state_features,
+                            embodiment_id=embodiment_id,
+                            context=prompt_embs,
+                            seq_len=seq_len,
+                            y=y,
+                            clip_feature=self.clip_feas,
+                            kv_caches=kv_caches,
+                            crossattn_caches=crossattn_caches,
+                            kv_cache_metadata=dict(
+                                start_frame=self.current_start_frame,
+                                update_kv_cache=False,
+                            ),
+                        )
+                    flow_pred_cond, flow_pred_cond_action = predictions[0]
+                    flow_pred_uncond, flow_pred_uncond_action = predictions[1]
+
+                    flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
+                    prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
+                    max_cache_size = 2
+                    if len(prev_predictions) > max_cache_size:
+                        prev_predictions.pop(0)
+
                 else:
-                    y = self.ys[:, :, -self.num_frame_per_block:]
-                predictions = self._run_diffusion_steps(
-                    noisy_input=noisy_input.transpose(1, 2),
-                    timestep=timestep,
-                    action=noisy_input_action,
-                    timestep_action=timestep_action,
-                    state=state_features,
-                    embodiment_id=embodiment_id,
-                    context=prompt_embs,
-                    seq_len=seq_len,
-                    y=y,
-                    clip_feature=self.clip_feas,
-                    kv_caches=kv_caches,
-                    crossattn_caches=crossattn_caches,
-                    kv_cache_metadata=dict(
-                        start_frame=self.current_start_frame,
-                        update_kv_cache=False,
-                    ),
-                )
-                flow_pred_cond, flow_pred_cond_action = predictions[0]
-                flow_pred_uncond, flow_pred_uncond_action = predictions[1]
-
-                flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
-                prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
-                max_cache_size = 2
-                if len(prev_predictions) > max_cache_size:
-                    prev_predictions.pop(0)
-
-            else:
-                assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
-                _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
+                    assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
+                    _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
 
             end_diffusion_events[index].record()
 
