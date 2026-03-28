@@ -3,7 +3,16 @@ import logging
 import time
 from typing import TypeAlias, cast
 import os
-import nvtx
+from contextlib import contextmanager
+import torch.cuda.nvtx as _nvtx
+
+@contextmanager
+def nvtx_range(msg, color=None):
+    _nvtx.range_push(msg)
+    try:
+        yield
+    finally:
+        _nvtx.range_pop()
 
 from accelerate import load_checkpoint_and_dispatch
 
@@ -1049,7 +1058,7 @@ class WANPolicyHead(ActionHead):
 
         start_text_encoder_event.record()
 
-        with nvtx.annotate("text_encoder", color="blue"):
+        with nvtx_range("text_encoder"):
             text_inputs = self._prepare_text_inputs(data)
             prompt_embs = [self.encode_prompt(text, attention_mask) for text, attention_mask in text_inputs]
 
@@ -1057,7 +1066,7 @@ class WANPolicyHead(ActionHead):
         
         start_image_encoder_event.record()
 
-        with nvtx.annotate("image_encoder", color="cyan"):
+        with nvtx_range("image_encoder"):
             _, _, num_frames, height, width = videos.shape
             if videos.shape[2] == 4 or videos.shape[2] == 9:
                 # special case for real-world eval where language is updated
@@ -1076,7 +1085,7 @@ class WANPolicyHead(ActionHead):
 
         start_vae_event.record()
 
-        with nvtx.annotate("vae_encoder", color="yellow"):
+        with nvtx_range("vae_encoder"):
             if latent_video is not None and self.current_start_frame != 0:
                 image = latent_video
                 if self.ip_rank == 0:
@@ -1144,7 +1153,7 @@ class WANPolicyHead(ActionHead):
 
         start_kv_event.record()
 
-        with nvtx.annotate("kv_cache_prefill", color="orange"):
+        with nvtx_range("kv_cache_prefill"):
             if self.current_start_frame == 0:
                 timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
                 self._run_diffusion_steps(
@@ -1234,7 +1243,7 @@ class WANPolicyHead(ActionHead):
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
             start_diffusion_events[index].record()
 
-            with nvtx.annotate(f"dit_step_{index}", color="red"):
+            with nvtx_range(f"dit_step_{index}"):
                 # Get timesteps from respective schedulers
                 action_timestep = sample_scheduler_action.timesteps[index]
                 video_timestep = sample_scheduler.timesteps[index]  # Already rescaled if decoupled
@@ -1259,7 +1268,7 @@ class WANPolicyHead(ActionHead):
                         y = self.ys[:, :, self.current_start_frame : self.current_start_frame + self.num_frame_per_block]
                     else:
                         y = self.ys[:, :, -self.num_frame_per_block:]
-                    with nvtx.annotate("dit_forward", color="magenta"):
+                    with nvtx_range("dit_forward"):
                         predictions = self._run_diffusion_steps(
                             noisy_input=noisy_input.transpose(1, 2),
                             timestep=timestep,
