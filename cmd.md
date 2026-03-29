@@ -28,11 +28,12 @@ pkill -SIGTERM -f torchrun
 ##### ncu Kernel Profiling (Roofline — compute-bound vs memory-bound)
 # Terminal 1: launch server under ncu, targeting only the dit_forward NVTX range
 mkdir -p results
-CUDA_VISIBLE_DEVICES=0,3 ncu \
+TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=2,3 ncu \
   --nvtx \
   --nvtx-include "dit_forward" \
   --set roofline \
   --target-processes all \
+  --target-processes-filter python3 \
   -o results/dreamzero_ncu \
   -f \
   torchrun --nproc_per_node=2 socket_test_optimized_AR.py \
