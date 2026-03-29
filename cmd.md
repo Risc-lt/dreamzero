@@ -30,10 +30,9 @@ pkill -SIGTERM -f torchrun
 mkdir -p results
 TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=2,3 ncu \
   --nvtx \
-  --nvtx-include "dit_forward" \
+  --nvtx-include "dit_forward]" \
   --set roofline \
   --target-processes all \
-  --target-processes-filter python3 \
   -o results/dreamzero_ncu \
   -f \
   torchrun --nproc_per_node=2 socket_test_optimized_AR.py \
