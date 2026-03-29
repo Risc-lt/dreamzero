@@ -34,10 +34,26 @@ TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=2,3 ncu \
   --set roofline \
   --target-processes all \
   -o results/dreamzero_ncu \
+  -c 500 \
   -f \
   torchrun --nproc_per_node=2 socket_test_optimized_AR.py \
     --port 5000 --enable-dit-cache \
     --model-path ./checkpoints/DreamZero-DROID
+
+TOKENIZERS_PARALLELISM=false CUDA_VISIBLE_DEVICES=6,7 ncu \
+  --nvtx \
+  --nvtx-include "vae_encoder]" \
+  --nvtx-include "image_encoder]" \
+  --nvtx-include "text_encoder]" \
+  --set roofline \
+  --target-processes all \
+  -o results/dreamzero_ncu_encoders \
+  -c 500 \
+  -f \
+  torchrun --nproc_per_node=2 socket_test_optimized_AR.py \
+    --port 5000 --enable-dit-cache \
+    --model-path ./checkpoints/DreamZero-DROID
+
 
 # Terminal 2: send a request to trigger inference (do this twice — first is KV prefill, second is cached)
 python test_client_AR.py --port 5000
